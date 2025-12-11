@@ -1,6 +1,7 @@
 # app.py
+
 import os
-from typing import Optional, Tuple, List
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -21,18 +22,26 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------
-# Data loading helpers
+# DATA LOADING & BASIC CLEANING
 # ---------------------------------------------------------------------
+
 BASE_PARQUET = "data/processed/pttw_analysis_ready.parquet"
 BASE_CSV = "data/processed/pttw_analysis_ready.csv"
+RAW_PATH = "data/raw/PermitsToTakeWater.csv"
 
-SUMMARY_DIR = "data/processed/summaries"
-SPATIAL_DIR = "data/processed/spatial_summaries"
+RAW_DATE_COLS = ["IssuedDate", "ExpiryDate", "RenewDate", "Permit_End"]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=True)
 def load_base_data() -> pd.DataFrame:
-    """Load the main analysis-ready dataset."""
+    """
+    Load the main analysis-ready dataset.
+
+    Priority:
+    1. Use processed parquet/CSV from data/processed if available.
+    2. Otherwise, read data/raw/PermitsToTakeWater.csv and do core cleaning.
+    """
+    # 1) processed
     if os.path.exists(BASE_PARQUET):
         df = pd.read_parquet(BASE_PARQUET)
     elif os.path.exists(BASE_CSV):
@@ -41,88 +50,210 @@ def load_base_data() -> pd.DataFrame:
             parse_dates=["issued_date", "expiry_date", "renew_date", "permit_end_date"],
         )
     else:
-        raise FileNotFoundError(
-            "Could not find pttw_analysis_ready.* in data/processed/. "
-            "Run the cleaning notebooks to generate it."
+        # 2) raw fallback
+        if not os.path.exists(RAW_PATH):
+            st.error(
+                "❌ Could not find any processed dataset in `data/processed/`, "
+                "and the raw file `data/raw/PermitsToTakeWater.csv` is also missing.\n\n"
+                "To fix this, add one of these:\n"
+                "• `data/processed/pttw_analysis_ready.parquet` (preferred), or\n"
+                "• `data/raw/PermitsToTakeWater.csv`."
+            )
+            st.stop()
+
+        df = pd.read_csv(RAW_PATH, encoding="latin1")
+
+        # parse original date columns
+        for col in RAW_DATE_COLS:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # standardise column names
+        df.columns = (
+            df.columns
+            .str.strip()
+            .str.replace(" ", "_")
+            .str.replace("/", "_", regex=False)
+            .str.replace("-", "_", regex=False)
+            .str.replace("(", "", regex=False)
+            .str.replace(")", "", regex=False)
+            .str.lower()
         )
 
-    # Ensure datetime columns
+        # rename to analysis-friendly names
+        rename_map = {
+            "maxl_day": "max_l_per_day",
+            "days_year": "days_per_year",
+            "hrs_daymax": "max_hours_per_day",
+            "l_minute": "l_per_minute",
+            "issueddate": "issued_date",
+            "expirydate": "expiry_date",
+            "renewdate": "renew_date",
+            "permit_end": "permit_end_date",
+            "surfgrnd": "surface_or_ground",
+            "purposecat": "purpose_category",
+            "spurpose": "specific_purpose",
+        }
+        df = df.rename(columns=rename_map)
+
+        # numeric cleaning
+        num_cols = ["max_l_per_day", "days_per_year", "max_hours_per_day", "l_per_minute"]
+        for col in num_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "max_l_per_day" in df.columns:
+            df.loc[df["max_l_per_day"] <= 0, "max_l_per_day"] = np.nan
+
+        # engineered features
+        if {"max_l_per_day", "days_per_year"}.issubset(df.columns):
+            df["max_l_per_year"] = df["max_l_per_day"] * df["days_per_year"]
+            df["max_m3_per_day"] = df["max_l_per_day"] / 1000
+            df["max_m3_per_year"] = df["max_l_per_year"] / 1000
+
+        if {"issued_date", "expiry_date"}.issubset(df.columns):
+            df["permit_duration_days"] = (df["expiry_date"] - df["issued_date"]).dt.days
+            df["permit_duration_years"] = df["permit_duration_days"] / 365.25
+
+        if "surface_or_ground" in df.columns:
+            upper = df["surface_or_ground"].astype("string").str.upper()
+            df["is_surface_water"] = np.where(upper.str.startswith("S"), 1, 0)
+            df["is_groundwater"] = np.where(upper.str.startswith("G"), 1, 0)
+
+        if "active" in df.columns:
+            df["active"] = df["active"].astype("string").str.title()
+
+        df = df.drop_duplicates()
+
+    # ensure datetime + handy time columns
     for col in ["issued_date", "expiry_date", "renew_date", "permit_end_date"]:
         if col in df.columns and not np.issubdtype(df[col].dtype, np.datetime64):
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Add handy time columns if missing
-    if "issued_year" not in df.columns and "issued_date" in df.columns:
+    if "issued_date" in df.columns and "issued_year" not in df.columns:
         df["issued_year"] = df["issued_date"].dt.year
-    if "issued_year_month" not in df.columns and "issued_date" in df.columns:
+    if "issued_date" in df.columns and "issued_year_month" not in df.columns:
         df["issued_year_month"] = df["issued_date"].dt.to_period("M").astype(str)
 
     return df
 
 
-def _load_indexed_summary(path: str, index_name: str) -> Optional[pd.DataFrame]:
-    """Read a summary CSV that was saved with an index, and restore the index as a column."""
-    if not os.path.exists(path):
-        return None
-
-    df = pd.read_csv(path)
-    # Handle common 'Unnamed: 0' pattern from pandas .to_csv()
-    if "Unnamed: 0" in df.columns and index_name not in df.columns:
-        df = df.rename(columns={"Unnamed: 0": index_name})
-
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def load_summaries():
-    yearly = _load_indexed_summary(
-        os.path.join(SUMMARY_DIR, "yearly_summary.csv"), "issued_year"
-    )
-    sector = _load_indexed_summary(
-        os.path.join(SUMMARY_DIR, "sector_summary.csv"), "purpose_category"
-    )
-    source = _load_indexed_summary(
-        os.path.join(SUMMARY_DIR, "source_summary.csv"), "surface_or_ground"
-    )
-
-    outliers_path = os.path.join(SUMMARY_DIR, "largest_permits_top_outliers.csv")
-    outliers = pd.read_csv(outliers_path, parse_dates=["issued_date", "expiry_date"]) \
-        if os.path.exists(outliers_path) \
-        else None
-
-    return yearly, sector, source, outliers
-
-
-@st.cache_data(show_spinner=False)
-def load_spatial_summaries():
-    grid_path = os.path.join(SPATIAL_DIR, "grid_volume_summary.csv")
-    grid = pd.read_csv(grid_path) if os.path.exists(grid_path) else None
-
-    clusters_path = os.path.join(SPATIAL_DIR, "high_volume_clusters.csv")
-    clusters = pd.read_csv(clusters_path) if os.path.exists(clusters_path) else None
-
-    municip_path = os.path.join(SPATIAL_DIR, "municipality_summary.csv")
-    municip = _load_indexed_summary(municip_path, "p_municip") if os.path.exists(municip_path) else None
-
-    return grid, clusters, municip
-
-
-# Load everything once (cached) ---------------------------------------
 pttw = load_base_data()
-yearly_summary, sector_summary, source_summary, outliers_df = load_summaries()
-grid_summary, clusters_df, municip_summary = load_spatial_summaries()
 
 
 # ---------------------------------------------------------------------
-# Sidebar navigation
+# SUMMARY BUILDERS (ALL FROM pttw)
 # ---------------------------------------------------------------------
+
+@st.cache_data
+def yearly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    d = df[df["issued_year"].notna()].copy()
+    g = (
+        d.groupby("issued_year")
+        .agg(
+            permit_count=("permitno", "nunique"),
+            total_m3_per_year=("max_m3_per_year", "sum"),
+            median_m3_per_year=("max_m3_per_year", "median"),
+        )
+        .reset_index()
+    )
+    return g
+
+
+@st.cache_data
+def sector_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if "purpose_category" not in df.columns:
+        return pd.DataFrame()
+    d = df.copy()
+    g = (
+        d.groupby("purpose_category")
+        .agg(
+            permit_count=("permitno", "nunique"),
+            total_m3_per_year=("max_m3_per_year", "sum"),
+            median_m3_per_year=("max_m3_per_year", "median"),
+        )
+        .reset_index()
+    )
+    total = g["total_m3_per_year"].sum()
+    if total > 0:
+        g["share_of_volume_%"] = g["total_m3_per_year"] / total * 100
+    else:
+        g["share_of_volume_%"] = np.nan
+    return g
+
+
+@st.cache_data
+def source_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if "surface_or_ground" not in df.columns:
+        return pd.DataFrame()
+    g = (
+        df.groupby("surface_or_ground")
+        .agg(
+            permit_count=("permitno", "nunique"),
+            total_m3_per_year=("max_m3_per_year", "sum"),
+        )
+        .reset_index()
+    )
+    total = g["total_m3_per_year"].sum()
+    if total > 0:
+        g["share_of_volume_%"] = g["total_m3_per_year"] / total * 100
+    else:
+        g["share_of_volume_%"] = np.nan
+    return g
+
+
+@st.cache_data
+def outlier_table(df: pd.DataFrame, q: float = 0.99) -> pd.DataFrame:
+    d = df[df["max_m3_per_year"] > 0].copy()
+    if d.empty:
+        return d
+    threshold = d["max_m3_per_year"].quantile(q)
+    out = d[d["max_m3_per_year"] >= threshold].copy()
+    out = out.sort_values("max_m3_per_year", ascending=False)
+    return out
+
+
+@st.cache_data
+def municipality_summary(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if "p_municip" not in df.columns:
+        return None
+    d = df.copy()
+    g = (
+        d.groupby("p_municip")
+        .agg(
+            permit_count=("permitno", "nunique"),
+            total_m3_per_year=("max_m3_per_year", "sum"),
+        )
+        .reset_index()
+    )
+    return g
+
+
+# ---------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------
+
+def format_m3(x: float) -> str:
+    if x is None or np.isnan(x):
+        return "–"
+    if x >= 1e9:
+        return f"{x/1e9:,.2f} B"
+    if x >= 1e6:
+        return f"{x/1e6:,.2f} M"
+    if x >= 1e3:
+        return f"{x/1e3:,.2f} K"
+    return f"{x:,.0f}"
+
+
+# ---------------------------------------------------------------------
+# SIDEBAR NAVIGATION
+# ---------------------------------------------------------------------
+
 st.sidebar.title("💧 PTTW Analytics Dashboard")
 st.sidebar.markdown(
     """
-This dashboard explores Ontario’s **Permit-to-Take-Water (PTTW)** dataset
-from multiple angles: time, sector, source type, geography, and outliers.
-
-Use the navigation below to move between analytical views.
+Explore Ontario’s **Permit-to-Take-Water (PTTW)** data by time, sector,
+source type, geography, and outliers.
 """
 )
 
@@ -139,19 +270,6 @@ page = st.sidebar.radio(
 )
 
 
-# Small helper for nicer big numbers
-def format_m3(x: float) -> str:
-    if x is None or np.isnan(x):
-        return "–"
-    if x >= 1e9:
-        return f"{x/1e9:,.2f} B"
-    if x >= 1e6:
-        return f"{x/1e6:,.2f} M"
-    if x >= 1e3:
-        return f"{x/1e3:,.2f} K"
-    return f"{x:,.0f}"
-
-
 # ---------------------------------------------------------------------
 # PAGE 1 – OVERVIEW
 # ---------------------------------------------------------------------
@@ -159,76 +277,63 @@ if page == "Overview":
     st.title("Ontario Permit-to-Take-Water Analytics – Overview")
 
     st.markdown(
-        """
-This landing page gives a high-level view of **how much water is permitted**,  
-**how many permits are active**, and **how patterns have changed over time**.
-
-The numbers and charts below are calculated from the cleaned PTTW dataset used
-throughout this project.
-        """
+        "High-level view of **how much water is permitted** and "
+        "**how that has changed over time**."
     )
 
-    # --- headline metrics ---
-    latest_year = int(pttw["issued_year"].dropna().max())
-    base_filtered = pttw[pttw["issued_year"].notna()]
+    ysum = yearly_summary(pttw)
+    ssum = sector_summary(pttw)
 
-    total_permits = base_filtered["permitno"].nunique()
-    total_volume = base_filtered["max_m3_per_year"].sum()
+    # headline metrics
+    base = pttw[pttw["issued_year"].notna()]
+    total_permits = base["permitno"].nunique()
+    total_volume = base["max_m3_per_year"].sum()
 
-    latest = base_filtered[base_filtered["issued_year"] == latest_year]
-    latest_permits = latest["permitno"].nunique()
+    latest_year = int(base["issued_year"].max())
+    latest = base[base["issued_year"] == latest_year]
     latest_volume = latest["max_m3_per_year"].sum()
 
     prev_year = latest_year - 1
-    prev = base_filtered[base_filtered["issued_year"] == prev_year]
+    prev = base[base["issued_year"] == prev_year]
     prev_volume = prev["max_m3_per_year"].sum() if not prev.empty else np.nan
-
     yoy_change = (
         (latest_volume - prev_volume) / prev_volume * 100
         if prev_volume and prev_volume > 0
         else np.nan
     )
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric(
-        "Total permits (all years)",
-        f"{total_permits:,}",
-    )
-    col2.metric(
-        f"Permitted volume (all years, m³/year)",
-        format_m3(total_volume),
-    )
-    col3.metric(
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total permits (all years)", f"{total_permits:,}")
+    c2.metric("Permitted volume (all years, m³/year)", format_m3(total_volume))
+    c3.metric(
         f"{latest_year} total permitted volume (m³/year)",
         format_m3(latest_volume),
-        f"{yoy_change:+.1f} % vs {prev_year}" if not np.isnan(yoy_change) else None,
+        f"{yoy_change:+.1f}% vs {prev_year}" if not np.isnan(yoy_change) else None,
     )
 
     st.markdown("---")
 
-    # --- time series: permits & volume ---
-    if yearly_summary is not None:
-        ys = yearly_summary.copy()
-        ys = ys[ys["issued_year"].notna()]
-
-        min_year = int(ys["issued_year"].min())
-        max_year = int(ys["issued_year"].max())
-
+    # time series
+    if not ysum.empty:
+        min_year = int(ysum["issued_year"].min())
+        max_year = int(ysum["issued_year"].max())
         year_range = st.slider(
-            "Select year range for trend charts:",
+            "Year range for trends:",
             min_value=min_year,
             max_value=max_year,
             value=(min_year, max_year),
             step=1,
         )
-
-        ys_range = ys[(ys["issued_year"] >= year_range[0]) & (ys["issued_year"] <= year_range[1])]
+        ys = ysum[
+            (ysum["issued_year"] >= year_range[0])
+            & (ysum["issued_year"] <= year_range[1])
+        ]
 
         fig = go.Figure()
         fig.add_trace(
             go.Bar(
-                x=ys_range["issued_year"],
-                y=ys_range["permit_count"],
+                x=ys["issued_year"],
+                y=ys["permit_count"],
                 name="Number of permits",
                 opacity=0.6,
                 yaxis="y1",
@@ -236,64 +341,49 @@ throughout this project.
         )
         fig.add_trace(
             go.Scatter(
-                x=ys_range["issued_year"],
-                y=ys_range["total_m3_per_year"],
-                name="Total permitted volume (m³/year)",
+                x=ys["issued_year"],
+                y=ys["total_m3_per_year"],
+                name="Total m³/year",
                 mode="lines+markers",
                 yaxis="y2",
             )
         )
-
         fig.update_layout(
             title="Permits and total permitted volume over time",
-            xaxis=dict(title="Year"),
-            yaxis=dict(title="Number of permits"),
+            xaxis_title="Year",
+            yaxis=dict(title="Permits", side="left"),
             yaxis2=dict(
                 title="Total m³/year",
                 overlaying="y",
                 side="right",
             ),
             legend=dict(orientation="h", y=-0.2),
-            margin=dict(l=40, r=40, t=50, b=60),
+            margin=dict(l=40, r=40, t=50, b=50),
         )
-
         st.plotly_chart(fig, use_container_width=True)
 
+    # sector bar
     st.markdown("### Top sectors by permitted volume")
-
-    if sector_summary is not None:
+    if not ssum.empty:
         top_n = st.slider("Show top N sectors:", 3, 15, 8)
-        s = sector_summary.sort_values("total_m3_per_year", ascending=False).head(top_n)
-
+        s = ssum.sort_values("total_m3_per_year", ascending=False).head(top_n)
         fig2 = px.bar(
             s,
             x="purpose_category",
             y="total_m3_per_year",
             text="share_of_volume_%",
             labels={
-                "purpose_category": "Purpose category",
+                "purpose_category": "Sector",
                 "total_m3_per_year": "Total m³/year",
-                "share_of_volume_%": "Share of total volume (%)",
+                "share_of_volume_%": "Share of volume (%)",
             },
         )
         fig2.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
         fig2.update_layout(
             xaxis_tickangle=45,
-            title="Top sectors by total permitted volume",
-            margin=dict(l=40, r=40, t=60, b=120),
+            margin=dict(l=40, r=40, t=40, b=120),
         )
         st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown(
-        """
-**How to read this page**
-
-- The metrics at the top summarize the scale of the permitting system.
-- The combined bar/line chart shows whether growth over time is driven by
-  **more permits** or **larger volumes per permit**.
-- The sector bar chart highlights which types of use dominate provincial water demand.
-        """
-    )
 
 
 # ---------------------------------------------------------------------
@@ -301,25 +391,19 @@ throughout this project.
 # ---------------------------------------------------------------------
 elif page == "Sector Explorer":
     st.title("Sector Explorer")
-
     st.markdown(
-        """
-This page lets you drill into specific **purpose categories** and understand their
-behaviour over time and in terms of volume distribution.
-
-Use the controls below to select one or more sectors and explore how their
-permitted volumes compare.
-        """
+        "Compare **sectors** over time and inspect their volume distributions."
     )
 
-    if sector_summary is None:
-        st.warning("Sector summary not found. Make sure sector_summary.csv exists.")
+    ssum = sector_summary(pttw)
+    if ssum.empty:
+        st.warning("No `purpose_category` column found – cannot build sector view.")
     else:
-        all_sectors = list(sector_summary["purpose_category"])
+        all_sectors = sorted(ssum["purpose_category"].tolist())
         default_sectors = all_sectors[:4] if len(all_sectors) >= 4 else all_sectors
 
         selected = st.multiselect(
-            "Select sectors to explore:",
+            "Select sectors:",
             options=all_sectors,
             default=default_sectors,
         )
@@ -328,15 +412,13 @@ permitted volumes compare.
         df = df[df["issued_year"].notna()]
 
         if df.empty:
-            st.info("No data available for the selected sectors.")
+            st.info("No data for the selected sectors.")
         else:
-            # Time series by sector
             grp = (
                 df.groupby(["issued_year", "purpose_category"])
                 .agg(total_m3_per_year=("max_m3_per_year", "sum"))
                 .reset_index()
             )
-
             fig = px.line(
                 grp,
                 x="issued_year",
@@ -346,58 +428,28 @@ permitted volumes compare.
                 labels={
                     "issued_year": "Year",
                     "total_m3_per_year": "Total m³/year",
-                    "purpose_category": "Purpose category",
+                    "purpose_category": "Sector",
                 },
-                title="Total permitted volume over time by sector",
             )
+            fig.update_layout(title="Total permitted volume over time by sector")
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("### Distribution of permitted volumes by sector (log scale)")
-            df_box = df[df["max_m3_per_year"] > 0]
-
+            st.markdown("### Distribution of permitted volumes (log scale)")
+            d_box = df[df["max_m3_per_year"] > 0]
             fig_box = px.box(
-                df_box,
+                d_box,
                 x="purpose_category",
                 y="max_m3_per_year",
                 color="purpose_category",
                 points=False,
                 labels={
-                    "purpose_category": "Purpose category",
+                    "purpose_category": "Sector",
                     "max_m3_per_year": "Max m³/year per permit",
                 },
             )
-            fig_box.update_layout(xaxis_tickangle=45)
             fig_box.update_yaxes(type="log")
+            fig_box.update_layout(xaxis_tickangle=45)
             st.plotly_chart(fig_box, use_container_width=True)
-
-            # Summary table
-            st.markdown("### Sector summary table")
-            sector_stats = (
-                df.groupby("purpose_category")
-                .agg(
-                    permits=("permitno", "nunique"),
-                    total_m3_per_year=("max_m3_per_year", "sum"),
-                    median_m3_per_year=("max_m3_per_year", "median"),
-                    p90_m3_per_year=("max_m3_per_year", lambda x: np.quantile(x, 0.9)),
-                )
-                .reset_index()
-            )
-            sector_stats["total_m3_per_year_fmt"] = sector_stats["total_m3_per_year"].apply(format_m3)
-
-            st.dataframe(
-                sector_stats[
-                    ["purpose_category", "permits", "total_m3_per_year_fmt", "median_m3_per_year", "p90_m3_per_year"]
-                ].rename(
-                    columns={
-                        "purpose_category": "Sector",
-                        "permits": "Number of permits",
-                        "total_m3_per_year_fmt": "Total m³/year (formatted)",
-                        "median_m3_per_year": "Median m³/year per permit",
-                        "p90_m3_per_year": "90th percentile m³/year per permit",
-                    }
-                ),
-                use_container_width=True,
-            )
 
 
 # ---------------------------------------------------------------------
@@ -405,32 +457,26 @@ permitted volumes compare.
 # ---------------------------------------------------------------------
 elif page == "Surface vs Groundwater":
     st.title("Surface vs Groundwater")
-
     st.markdown(
-        """
-This page compares **surface water** and **groundwater** permits:
-how many there are, how much volume they account for, and how their
-importance has evolved over time.
-        """
+        "Compare **surface water** and **groundwater** in terms of permits and volume."
     )
 
-    if source_summary is None:
-        st.warning("Source summary not found. Make sure source_summary.csv exists.")
+    ssum = source_summary(pttw)
+    if ssum.empty:
+        st.warning("No `surface_or_ground` column found – cannot build this view.")
     else:
-        col1, col2 = st.columns([1, 1])
-
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             fig_pie = px.pie(
-                source_summary,
+                ssum,
                 names="surface_or_ground",
                 values="total_m3_per_year",
-                title="Share of total permitted volume by source type",
+                title="Share of total permitted volume",
             )
             st.plotly_chart(fig_pie, use_container_width=True)
-
-        with col2:
+        with c2:
             fig_bar = px.bar(
-                source_summary,
+                ssum,
                 x="surface_or_ground",
                 y="permit_count",
                 labels={
@@ -439,17 +485,14 @@ importance has evolved over time.
                 },
                 title="Number of permits by source type",
             )
-            fig_bar.update_xaxes(categoryorder="total descending")
             st.plotly_chart(fig_bar, use_container_width=True)
 
-        # Time series by source type
         df = pttw[pttw["issued_year"].notna()].copy()
         grp = (
             df.groupby(["issued_year", "surface_or_ground"])
             .agg(total_m3_per_year=("max_m3_per_year", "sum"))
             .reset_index()
         )
-
         fig_ts = px.line(
             grp,
             x="issued_year",
@@ -465,34 +508,16 @@ importance has evolved over time.
         )
         st.plotly_chart(fig_ts, use_container_width=True)
 
-        st.markdown(
-            """
-**Interpretation**
-
-- The pie and bar charts show the relative importance of surface vs. groundwater.
-- The time series reveals whether pressures on each source type are
-  **increasing**, **decreasing**, or **stable** over time.
-            """
-        )
-
 
 # ---------------------------------------------------------------------
 # PAGE 4 – SPATIAL EXPLORER
 # ---------------------------------------------------------------------
 elif page == "Spatial Explorer":
     st.title("Spatial Explorer")
-
     st.markdown(
-        """
-This page visualizes the spatial footprint of water-taking permits using
-interactive maps. The focus is on **where** large withdrawals are concentrated
-rather than on detailed cartography.
-
-Use the controls to filter by year, sector, and minimum permitted volume.
-        """
+        "Interactive map of **high-volume permits**, with filters for year and volume."
     )
 
-    # Need coordinates
     if not {"latitude", "longitude"}.issubset(pttw.columns):
         st.warning("Latitude/longitude columns not found in the dataset.")
     else:
@@ -516,27 +541,21 @@ Use the controls to filter by year, sector, and minimum permitted volume.
                 step=1,
             )
         with c2:
-            volume_quantile = st.slider(
-                "Minimum volume filter (quantile on max m³/year per permit):",
-                min_value=0.0,
-                max_value=0.99,
-                value=0.8,
-                step=0.01,
+            volume_q = st.slider(
+                "Minimum volume (quantile on max m³/year per permit):",
+                0.0, 0.99, 0.8, 0.01,
             )
 
-        q_threshold = geo["max_m3_per_year"].quantile(volume_quantile)
+        threshold = geo["max_m3_per_year"].quantile(volume_q)
         geo_filt = geo[
             (geo["issued_year"] >= year_min)
             & (geo["issued_year"] <= year_max)
-            & (geo["max_m3_per_year"] >= q_threshold)
-        ].copy()
+            & (geo["max_m3_per_year"] >= threshold)
+        ]
 
         if geo_filt.empty:
             st.info("No permits match the current filters.")
         else:
-            # Map 1: high-volume permits as points
-            st.markdown("### High-volume permits (point map)")
-
             fig_map = px.scatter_mapbox(
                 geo_filt,
                 lat="latitude",
@@ -557,68 +576,31 @@ Use the controls to filter by year, sector, and minimum permitted volume.
                 mapbox_style="open-street-map",
                 margin=dict(l=0, r=0, t=40, b=0),
                 legend=dict(orientation="h", y=-0.1),
-                title="Location of high-volume permits (size scaled by max m³/year)",
+                title="High-volume permits (circle size = max m³/year)",
             )
             st.plotly_chart(fig_map, use_container_width=True)
 
-        # Cluster overlay if available
-        if clusters_df is not None and {"latitude", "longitude"}.issubset(
-            clusters_df.columns
-        ):
-            st.markdown("### Clusters of very high-volume permits")
-
-            fig_cluster = px.scatter_mapbox(
-                clusters_df,
-                lat="latitude",
-                lon="longitude",
-                color="cluster",
-                size="max_m3_per_year",
-                hover_data={
-                    "permitno": True,
-                    "max_m3_per_year": ":,.0f",
-                },
-                zoom=4,
-                height=500,
-            )
-            fig_cluster.update_layout(
-                mapbox_style="open-street-map",
-                margin=dict(l=0, r=0, t=40, b=0),
-                legend=dict(orientation="h", y=-0.1),
-                title="K-means clusters of top 10% highest-volume permits",
-            )
-            st.plotly_chart(fig_cluster, use_container_width=True)
-
-        if municip_summary is not None:
+        # simple municipality ranking if available
+        msum = municipality_summary(pttw)
+        if msum is not None and not msum.empty:
             st.markdown("### Top municipalities by total permitted volume")
             top_m = (
-                municip_summary.sort_values("total_m3_per_year", ascending=False)
+                msum.sort_values("total_m3_per_year", ascending=False)
                 .head(15)
                 .copy()
             )
             top_m["total_m3_per_year_fmt"] = top_m["total_m3_per_year"].apply(format_m3)
-
             st.dataframe(
                 top_m[["p_municip", "total_m3_per_year_fmt", "permit_count"]]
                 .rename(
                     columns={
                         "p_municip": "Municipality",
-                        "permit_count": "Number of permits",
-                        "total_m3_per_year_fmt": "Total m³/year (formatted)",
+                        "total_m3_per_year_fmt": "Total m³/year",
+                        "permit_count": "Permits",
                     }
                 ),
                 use_container_width=True,
             )
-
-    st.markdown(
-        """
-**Reading these maps**
-
-- Larger circles indicate permits with larger **maximum annual volumes**.
-- Colors distinguish purpose categories or clusters of extremely large users.
-- The municipality table helps identify administrative areas with the highest
-  permitted withdrawals.
-        """
-    )
 
 
 # ---------------------------------------------------------------------
@@ -626,41 +608,33 @@ Use the controls to filter by year, sector, and minimum permitted volume.
 # ---------------------------------------------------------------------
 elif page == "Outlier Explorer":
     st.title("Outlier Explorer")
+    st.markdown("Focus on the **largest individual permits** in the dataset.")
 
-    st.markdown(
-        """
-This page focuses on the **largest individual permits** in the dataset.
-These outliers often represent disproportionate shares of total permitted volume
-and may warrant closer regulatory or policy attention.
-        """
-    )
-
-    if outliers_df is None:
-        st.warning("Outlier table not found. Make sure largest_permits_top_outliers.csv exists.")
+    out = outlier_table(pttw, q=0.99)
+    if out.empty:
+        st.info("No outliers found (check that `max_m3_per_year` exists and is > 0).")
     else:
-        df = outliers_df.copy()
-
-        # Filters
-        sectors = sorted(df["purpose_category"].dropna().unique().tolist())
-        sources = sorted(df["surface_or_ground"].dropna().unique().tolist())
+        sectors = sorted(out["purpose_category"].dropna().unique().tolist()) \
+            if "purpose_category" in out.columns else []
+        sources = sorted(out["surface_or_ground"].dropna().unique().tolist()) \
+            if "surface_or_ground" in out.columns else []
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            sector_filter = st.multiselect(
-                "Filter by sector (optional):",
+            sec_filter = st.multiselect(
+                "Sector filter:",
                 options=sectors,
                 default=[],
             )
         with c2:
-            source_filter = st.multiselect(
-                "Filter by source type (optional):",
+            src_filter = st.multiselect(
+                "Source filter:",
                 options=sources,
                 default=[],
             )
         with c3:
-            year_min, year_max = int(df["issued_date"].dt.year.min()), int(
-                df["issued_date"].dt.year.max()
-            )
+            year_min = int(out["issued_date"].dt.year.min())
+            year_max = int(out["issued_date"].dt.year.max())
             year_range = st.slider(
                 "Issue year range:",
                 min_value=year_min,
@@ -668,37 +642,33 @@ and may warrant closer regulatory or policy attention.
                 value=(year_min, year_max),
             )
 
-        mask = (
-            (df["issued_date"].dt.year.between(year_range[0], year_range[1]))
-        )
-        if sector_filter:
-            mask &= df["purpose_category"].isin(sector_filter)
-        if source_filter:
-            mask &= df["surface_or_ground"].isin(source_filter)
+        mask = out["issued_date"].dt.year.between(year_range[0], year_range[1])
+        if sec_filter:
+            mask &= out["purpose_category"].isin(sec_filter)
+        if src_filter:
+            mask &= out["surface_or_ground"].isin(src_filter)
 
-        df_filt = df[mask].copy().sort_values("max_m3_per_year", ascending=False)
+        out_f = out[mask].copy().sort_values("max_m3_per_year", ascending=False)
+        out_f["max_m3_per_year_fmt"] = out_f["max_m3_per_year"].apply(format_m3)
 
-        st.markdown("### Largest permits (filtered view)")
-
-        df_filt["max_m3_per_year_fmt"] = df_filt["max_m3_per_year"].apply(format_m3)
-
+        st.markdown("### Largest permits (filtered)")
+        cols_to_show = [
+            "permitno",
+            "purpose_category",
+            "specific_purpose",
+            "surface_or_ground",
+            "max_m3_per_year_fmt",
+            "issued_date",
+            "expiry_date",
+        ]
+        cols_present = [c for c in cols_to_show if c in out_f.columns]
         st.dataframe(
-            df_filt[
-                [
-                    "permitno",
-                    "purpose_category",
-                    "specific_purpose",
-                    "surface_or_ground",
-                    "max_m3_per_year_fmt",
-                    "issued_date",
-                    "expiry_date",
-                ]
-            ].rename(
+            out_f[cols_present].rename(
                 columns={
                     "permitno": "Permit ID",
                     "purpose_category": "Sector",
                     "specific_purpose": "Specific purpose",
-                    "surface_or_ground": "Source type",
+                    "surface_or_ground": "Source",
                     "max_m3_per_year_fmt": "Max m³/year",
                     "issued_date": "Issued",
                     "expiry_date": "Expiry",
@@ -708,40 +678,21 @@ and may warrant closer regulatory or policy attention.
             height=450,
         )
 
-        st.markdown("### Volume vs permit duration (for outliers)")
-
-        if "permit_duration_years" in pttw.columns:
-            merged = df_filt.merge(
-                pttw[["permitno", "permit_duration_years"]],
-                on="permitno",
-                how="left",
-            )
-
-            fig_scatter = px.scatter(
-                merged,
+        if "permit_duration_years" in out_f.columns:
+            st.markdown("### Volume vs permit duration (log scale on volume)")
+            fig_sc = px.scatter(
+                out_f,
                 x="permit_duration_years",
                 y="max_m3_per_year",
-                color="purpose_category",
-                hover_data=["permitno", "specific_purpose", "surface_or_ground"],
+                color="purpose_category" if "purpose_category" in out_f.columns else None,
+                hover_data=["permitno", "surface_or_ground"] if "surface_or_ground" in out_f.columns else ["permitno"],
                 labels={
                     "permit_duration_years": "Permit duration (years)",
                     "max_m3_per_year": "Max m³/year",
-                    "purpose_category": "Sector",
                 },
-                title="Outlier permits – volume vs duration",
             )
-            fig_scatter.update_yaxes(type="log")
-            st.plotly_chart(fig_scatter, use_container_width=True)
-
-    st.markdown(
-        """
-**How to use this page**
-
-- Narrow the list using sector, source type, and issue-year filters.
-- Scan the table to identify permits with especially large volumes or long durations.
-- The scatter plot shows whether **long-lived permits** tend to also be **high-volume**.
-        """
-    )
+            fig_sc.update_yaxes(type="log")
+            st.plotly_chart(fig_sc, use_container_width=True)
 
 
 # ---------------------------------------------------------------------
@@ -752,73 +703,14 @@ else:
 
     st.markdown(
         """
-### Project overview
+**What this dashboard does**
 
-This project analyzes Ontario’s **Permit-to-Take-Water (PTTW)** dataset to
-understand patterns in water-taking activity across **time**, **sectors**,
-**source types**, and **geography**.
+- Ingests Ontario’s PTTW permit data.
+- Cleans and standardises key fields (dates, sectors, source types, volumes).
+- Derives annual volumes, permit durations, and simple flags for surface vs groundwater.
+- Builds time-series, sector profiles, spatial maps, and outlier views.
 
-The analysis pipeline is organized into four main stages:
-
-1. **Data ingestion and initial inspection**  
-   - Load the raw permit dataset and review basic structure and completeness.
-
-2. **Cleaning and feature engineering**  
-   - Standardize column names and data types.  
-   - Parse and validate dates (issue, expiry, renewal).  
-   - Compute key metrics such as:
-     - maximum litres per day  
-     - annual permitted volumes (converted to m³/year)  
-     - permit durations in days and years  
-     - flags for surface vs. groundwater.
-
-3. **Exploratory and spatial analysis**  
-   - Time series of permit counts and volumes.  
-   - Sector and specific-purpose profiles.  
-   - Surface vs groundwater comparisons over time.  
-   - Spatial intensity maps and clustering of high-volume permits.
-
-4. **Dashboard and reporting outputs**  
-   - Aggregated summary tables (by year, sector, source type, municipality).  
-   - Outlier lists of largest permits.  
-   - Map-friendly spatial summaries (grids and clusters).
-
----
-
-### How to interpret volumes
-
-All volume metrics in the dashboard represent **maximum permitted withdrawal rates**,
-not necessarily observed usage. They are expressed in **cubic metres per year (m³/year)**
-for comparability across permits.
-
-Where necessary, the project converts from:
-
-- Litres per day × days per year → annual volume (L/year)  
-- L/year ÷ 1,000 → m³/year
-
----
-
-### Limitations
-
-- Spatial visualizations use permit coordinates directly and may not capture
-  the full hydrologic context (e.g., aquifer boundaries, surface water routing).
-- Permits with missing or obviously invalid coordinates are excluded from
-  map-based views.
-- The dashboard focuses on **permitted maximums**, not actual measured withdrawals.
-
----
-
-### Reproducibility
-
-The notebooks and this dashboard are designed to be reproducible:
-
-- All intermediate datasets (cleaned tables and summaries) are saved under
-  `data/processed/` and reused here.
-- The dashboard code does not perform heavy transformations; it mainly reads
-  prepared tables and exposes them interactively.
-
-If you have access to the repository, you can rerun the entire pipeline by
-executing the notebooks in order and then launching this Streamlit app.
+The code you’re running is the same pipeline used in the notebooks, wrapped in
+an interactive Streamlit application.
         """
     )
-
