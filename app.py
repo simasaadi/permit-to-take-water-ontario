@@ -710,7 +710,5 @@ else:
 - Derives annual volumes, permit durations, and simple flags for surface vs groundwater.
 - Builds time-series, sector profiles, spatial maps, and outlier views.
 
-The code you’re running is the same pipeline used in the notebooks, wrapped in
-an interactive Streamlit application.
         """
     )
